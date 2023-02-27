@@ -73,7 +73,9 @@ public abstract class AbstractRemoteFileStreamingMessageSource<F>
 	private final AtomicInteger fetched = new AtomicInteger();
 
 	private boolean fileInfoJson = true;
-
+	
+	private Session<? extends F> session;
+	
 	/**
 	 * the path on the remote server.
 	 */
@@ -150,9 +152,14 @@ public abstract class AbstractRemoteFileStreamingMessageSource<F>
 	@Override
 	public final void onInit() {
 		Assert.state(this.remoteDirectoryExpression != null, "'remoteDirectoryExpression' must not be null");
+		openSession();
 		doInit();
 	}
-
+	
+	private void openSession() {
+		session = remoteFileTemplate.getSession();
+	}
+	
 	/**
 	 * Subclasses can override to perform initialization - called from
 	 * {@link org.springframework.beans.factory.InitializingBean#afterPropertiesSet()}.
@@ -180,6 +187,7 @@ public abstract class AbstractRemoteFileStreamingMessageSource<F>
 					file = this.toBeReceived.poll();
 				}
 			}
+			session.close();
 		}
 	}
 
@@ -191,6 +199,8 @@ public abstract class AbstractRemoteFileStreamingMessageSource<F>
 	@Override
 	protected Object doReceive(int maxFetchSize) {
 		Assert.state(this.running.get(), () -> getComponentName() + " is not running");
+		if (!session.isOpen()) openSession();
+		
 		if (maxFetchSize > 0 && this.fetched.get() >= maxFetchSize) {
 			this.toBeReceived.clear();
 			this.fetched.set(0);
@@ -219,7 +229,6 @@ public abstract class AbstractRemoteFileStreamingMessageSource<F>
 	private Object remoteFileToMessage(AbstractFileInfo<F> file) {
 		try {
 			String remotePath = remotePath(file);
-			Session<?> session = this.remoteFileTemplate.getSession();
 			try {
 				return getMessageBuilderFactory()
 						.withPayload(session.readRaw(remotePath))
@@ -231,7 +240,6 @@ public abstract class AbstractRemoteFileStreamingMessageSource<F>
 								this.fileInfoJson ? file.toJson() : file);
 			}
 			catch (IOException e) {
-				session.close();
 				throw new UncheckedIOException("IOException when retrieving " + remotePath, e);
 			}
 		}
@@ -264,30 +272,34 @@ public abstract class AbstractRemoteFileStreamingMessageSource<F>
 
 	private void listFiles() {
 		String remoteDirectory = this.remoteDirectoryExpression.getValue(getEvaluationContext(), String.class);
-		F[] files = this.remoteFileTemplate.list(remoteDirectory);
-		if (!ObjectUtils.isEmpty(files)) {
-			files = FileUtils.purgeUnwantedElements(files, f -> f == null || isDirectory(f), this.comparator);
-		}
-		if (!ObjectUtils.isEmpty(files)) {
-			List<AbstractFileInfo<F>> fileInfoList;
-			if (this.filter != null && !this.filter.supportsSingleFileFiltering()) {
-				int maxFetchSize = getMaxFetchSize();
-				List<F> filteredFiles = this.filter.filterFiles(files);
-				if (maxFetchSize > 0 && filteredFiles.size() > maxFetchSize) {
-					rollbackFromFileToListEnd(filteredFiles, filteredFiles.get(maxFetchSize));
-					List<F> newList = new ArrayList<>(maxFetchSize);
-					for (int i = 0; i < maxFetchSize; i++) {
-						newList.add(filteredFiles.get(i));
+		try {
+			F[] files = session.list(remoteDirectory);
+			if (!ObjectUtils.isEmpty(files)) {
+				files = FileUtils.purgeUnwantedElements(files, f -> f == null || isDirectory(f), this.comparator);
+			}
+			if (!ObjectUtils.isEmpty(files)) {
+				List<AbstractFileInfo<F>> fileInfoList;
+				if (this.filter != null && !this.filter.supportsSingleFileFiltering()) {
+					int maxFetchSize = getMaxFetchSize();
+					List<F> filteredFiles = this.filter.filterFiles(files);
+					if (maxFetchSize > 0 && filteredFiles.size() > maxFetchSize) {
+						rollbackFromFileToListEnd(filteredFiles, filteredFiles.get(maxFetchSize));
+						List<F> newList = new ArrayList<>(maxFetchSize);
+						for (int i = 0; i < maxFetchSize; i++) {
+							newList.add(filteredFiles.get(i));
+						}
+						filteredFiles = newList;
 					}
-					filteredFiles = newList;
+					fileInfoList = asFileInfoList(filteredFiles);
 				}
-				fileInfoList = asFileInfoList(filteredFiles);
+				else {
+					fileInfoList = asFileInfoList(Arrays.asList(files));
+				}
+				fileInfoList.forEach(fi -> fi.setRemoteDirectory(remoteDirectory));
+				this.toBeReceived.addAll(fileInfoList);
 			}
-			else {
-				fileInfoList = asFileInfoList(Arrays.asList(files));
-			}
-			fileInfoList.forEach(fi -> fi.setRemoteDirectory(remoteDirectory));
-			this.toBeReceived.addAll(fileInfoList);
+		} catch (IOException e) {
+			logger.error(e, LogMessage.format("Could not list remoteDirectory: %s", remoteDirectory));
 		}
 	}
 
